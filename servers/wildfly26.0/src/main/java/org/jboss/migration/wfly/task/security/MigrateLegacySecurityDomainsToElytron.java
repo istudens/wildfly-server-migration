@@ -30,6 +30,7 @@ import org.jboss.migration.wfly10.config.task.management.configuration.Manageabl
 import org.jboss.migration.wfly10.config.task.management.configuration.ManageableServerConfigurationLeafTask;
 import org.jboss.migration.wfly10.config.task.management.resource.ManageableResourceTaskRunnableBuilder;
 
+import static org.jboss.as.controller.descriptions.ModelDescriptionConstants.REALM;
 import static org.jboss.as.controller.descriptions.ModelDescriptionConstants.SERVER;
 import static org.jboss.as.controller.operations.common.Util.createAddOperation;
 import static org.jboss.as.controller.operations.common.Util.getUndefineAttributeOperation;
@@ -65,6 +66,9 @@ public class MigrateLegacySecurityDomainsToElytron<S> extends ManageableServerCo
         public static final String IDENTITY = "identity";
         public static final String ELYTRON = "elytron";
         public static final String ELYTRON_DOMAIN = "elytron-domain";
+        private static final String SERVER_SSL_CONTEXT = "server-ssl-context";
+        private static final String SERVER_REQUIRES_SSL = "server-requires-ssl";
+        private static final String SSL_SOCKET_BINDING = "ssl-socket-binding";
 
         protected UpdateSubsystems(final LegacySecurityConfigurations legacySecurityConfigurations) {
             name(SUBTASK_NAME);
@@ -94,16 +98,31 @@ public class MigrateLegacySecurityDomainsToElytron<S> extends ManageableServerCo
 
         protected boolean migrateSubsystemIIOP(LegacySecurityConfiguration legacySecurityConfiguration, SubsystemResource subsystemResource, TaskContext taskContext) {
             taskContext.getLogger().debugf("Looking for iiop-openjdk subsystem using legacy security domains.");
+            boolean requiresUpdate = false;
             final SubsystemResource iiopSubsystemResource = subsystemResource.getParentResource().getSubsystemResource(JBossSubsystemNames.IIOP_OPENJDK);
             if (iiopSubsystemResource != null) {
+                final Operations.CompositeOperationBuilder compositeOperationBuilder = Operations.CompositeOperationBuilder.create();
                 final String securityAttribute = iiopSubsystemResource.getResourceConfiguration().get(SECURITY).asStringOrNull();
                 if (CLIENT.equals(securityAttribute) || IDENTITY.equals(securityAttribute)) {
-                    subsystemResource.getServerConfiguration().executeManagementOperation(getWriteAttributeOperation(iiopSubsystemResource.getResourcePathAddress(), SECURITY, ELYTRON));
+                    compositeOperationBuilder.addStep(getWriteAttributeOperation(iiopSubsystemResource.getResourcePathAddress(), SECURITY, ELYTRON));
                     taskContext.getLogger().warnf("Migrated iiop-openjdk subsystem resource using legacy security domain to Elytron defaults. Please note that further manual Elytron configuration should be needed!");
-                    return true;
+                    requiresUpdate = true;
+                }
+                if (iiopSubsystemResource.getResourceConfiguration().hasDefined(SECURITY_DOMAIN)) {
+                    final String realm = iiopSubsystemResource.getResourceConfiguration().get(SECURITY_DOMAIN).asString();
+                    taskContext.getLogger().debugf("The iiop-openjdk subsystem resource using a legacy realm %s found.", realm);
+                    compositeOperationBuilder.addStep(getUndefineAttributeOperation(iiopSubsystemResource.getResourcePathAddress(), SECURITY_DOMAIN));
+                    compositeOperationBuilder.addStep(getWriteAttributeOperation(iiopSubsystemResource.getResourcePathAddress(), SERVER_SSL_CONTEXT, legacySecurityConfiguration.getDefaultElytronTLSServerSSLContextName()));
+                    compositeOperationBuilder.addStep(getWriteAttributeOperation(iiopSubsystemResource.getResourcePathAddress(), SERVER_REQUIRES_SSL, ModelNode.TRUE));
+                    compositeOperationBuilder.addStep(getWriteAttributeOperation(iiopSubsystemResource.getResourcePathAddress(), SSL_SOCKET_BINDING, "iiop-ssl"));  // FIXME check if there is any iiop-ssl socket binding
+                    taskContext.getLogger().warnf("Migrated iiop-openjdk subsystem resource using a legacy realm %s, to Elytron's default TLS ServerSSLContext %s. Please note that further manual Elytron configuration may be needed if the legacy security realm being used was not the source server's default Application Realm configuration!", realm, legacySecurityConfiguration.getDefaultElytronTLSServerSSLContextName());
+                    requiresUpdate = true;
+                }
+                if (requiresUpdate) {
+                    subsystemResource.getServerConfiguration().executeManagementOperation(compositeOperationBuilder.build().getOperation());
                 }
             }
-            return false;
+            return requiresUpdate;
         }
 
         protected boolean migrateSubsystemEJB3(LegacySecurityConfiguration legacySecurityConfiguration, SubsystemResource subsystemResource, TaskContext taskContext) {
